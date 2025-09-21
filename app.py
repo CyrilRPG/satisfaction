@@ -5,12 +5,14 @@
 # Streamlit App: Vues Feedback (Moyennes + Vues filtrées <3/5)
 # ──────────────────────────────────────────────────────────────────────────────
 # - Upload un Excel (une ou plusieurs feuilles).
-# - Détecte automatiquement les paires (Sur une échelle de 0 à 5 … -> Commentaire)
-#   où le commentaire est la colonne immédiatement suivante.
-# - Calcule la vue "Moyennes" (moyenne sur 5) par catégorie.
+# - Détecte automatiquement les paires (Échelle 0–5 → Commentaire) :
+#     * La colonne de note DOIT commencer par "Sur une échelle de 0 à 5 ..."
+#     * Le commentaire est la colonne IMMÉDIATEMENT suivante.
+# - Calcule la vue "Moyennes" (moyenne /5) par catégorie.
 # - Construit 5 vues (<3/5) : Coaching, Fiches de cours, Professeurs,
 #   Plateforme, Organisation générale.
 # - Permet de télécharger un Excel qui contient Moyennes + ces 5 vues.
+# - Lecture Excel robuste : essaie calamine → openpyxl → auto.
 # ──────────────────────────────────────────────────────────────────────────────
 
 import io
@@ -20,6 +22,10 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Vues Feedback – Diploma Santé", layout="wide")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config / Constantes
+# ──────────────────────────────────────────────────────────────────────────────
 
 # Catégories cibles (clés normalisées → libellés affichés)
 TARGET_VIEWS = [
@@ -41,13 +47,18 @@ REQUIRED_SHEETS = [
     "Organisation générale",
 ]
 
-SCALE_PREFIX = "sur une echelle de 0 a 5"  # version normalisée (sans accents)
+# Préfixe d’en-tête pour les colonnes de note — version normalisée (sans accents)
+SCALE_PREFIX = "sur une echelle de 0 a 5"
+
+# Mots-clés pour repérer la colonne de commentaire
+COMMENT_KEYWORDS = ("comment", "commentaire", "remarque", "avis")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def normalize(s: str) -> str:
+    """Normalise texte : retire accents, met en minuscules, compacte espaces."""
     if s is None:
         return ""
     s = str(s)
@@ -63,7 +74,7 @@ def parse_note(val):
     Accepte :
       - '2/5', '4 / 5'
       - '2,5', '3', '4.0'
-      - '4 - Plutôt satisfait', '5 – Très bien', etc. (extrait le 1er nombre)
+      - '4 - Plutôt satisfait', '5 – Très bien' (extrait le 1er nombre)
     """
     if pd.isna(val):
         return None
@@ -78,7 +89,7 @@ def parse_note(val):
     try:
         return float(s)
     except ValueError:
-        # Extraire le premier nombre rencontré
+        # Extraire le premier nombre rencontré (ex: "4 - Très bien")
         m2 = re.search(r"(\d+(?:\.\d+)?)", s)
         if m2:
             try:
@@ -89,10 +100,13 @@ def parse_note(val):
 
 def _try_read_excel_all_sheets(bio: io.BytesIO):
     """
-    Essaie plusieurs moteurs de lecture pour éviter l'ImportError d'openpyxl.
-    Ordre d'essai : openpyxl (xlsx), xlrd (xls legacy), calamine (xlsx/xls), auto.
+    Essaie plusieurs moteurs pour éviter les ImportError.
+    Ordre recommandé : calamine (rapide, .xlsx/.xls) → openpyxl (.xlsx) → auto.
+    Nécessite :
+      - pandas-calamine >= 0.2.0 pour 'calamine'
+      - openpyxl pour .xlsx (si pas de calamine)
     """
-    engines = ["openpyxl", "xlrd", "calamine", None]
+    engines = ["calamine", "openpyxl", None]
     last_err = None
     for eng in engines:
         try:
@@ -111,19 +125,25 @@ def read_all_sheets(uploaded_file) -> pd.DataFrame:
     Lit toutes les feuilles d’un Excel uploadé et les concatène.
     Robuste aux environnements sans openpyxl : essaie plusieurs moteurs.
     """
-    bytes_data = uploaded_file.read()
+    # Sur Streamlit Cloud, getvalue() est plus fiable que read()
+    try:
+        bytes_data = uploaded_file.getvalue()
+    except Exception:
+        bytes_data = uploaded_file.read()
+
     if not bytes_data:
         return pd.DataFrame()
+
     bio = io.BytesIO(bytes_data)
     try:
         sheets = _try_read_excel_all_sheets(bio)
     except Exception as e:
         st.error(
             "Impossible de lire le fichier Excel. "
-            "Installez au moins l’un des moteurs suivants dans votre environnement : "
-            "`openpyxl` (xlsx), `pandas-calamine` (xlsx/xls) ou `xlrd<=1.2.0` (xls). "
-            f"\n\nDétails techniques : {e}"
+            "Assure-toi d’installer au déploiement : `pandas-calamine` (conseillé) "
+            "ou `openpyxl`.\n\nDétails techniques : {}".format(e)
         )
+        st.exception(e)
         return pd.DataFrame()
 
     frames = []
@@ -134,6 +154,7 @@ def read_all_sheets(uploaded_file) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 def find_identity_columns(df: pd.DataFrame):
+    """Détecte Prénom / Nom / Email par heuristiques de noms de colonnes."""
     cols = {normalize(c): c for c in df.columns}
     first_name = next((cols[k] for k in cols if any(w in k for w in ["prenom", "prénom", "first name", "given name"])), None)
     last_name  = next((cols[k] for k in cols if any(w in k for w in ["nom", "last name", "surname", "family name"]) and "prenom" not in k and "prénom" not in k), None)
@@ -149,13 +170,12 @@ def find_identity_columns(df: pd.DataFrame):
 def _extract_category_from_scale_header(norm_header: str) -> str:
     """
     Reçoit un en-tête déjà normalisé.
-    Si l’en-tête commence par 'sur une echelle de 0 a 5', on renvoie la partie
+    Si l’en-tête commence par 'sur une echelle de 0 a 5', renvoie la partie
     après ce préfixe (nettoyée).
     """
     if not norm_header.startswith(SCALE_PREFIX):
         return ""
     tail = norm_header[len(SCALE_PREFIX):].strip(" :–—-")
-    # Supprimer ponctuation résiduelle, espaces, etc.
     tail = re.sub(r"\s+", " ", tail)
     return tail
 
@@ -172,52 +192,59 @@ def build_pairs(df: pd.DataFrame):
     pairs = {}
 
     for i, ncol in enumerate(norm):
-        # 1) Identifier les colonnes qui débutent par "Sur une échelle de 0 à 5"
+        # 1) Repérer les colonnes de note (préfixe exact après normalisation)
         if not ncol.startswith(SCALE_PREFIX):
             continue
-        # 2) La colonne suivante est le commentaire
+
+        # 2) La colonne suivante est censée être le commentaire
         if i + 1 >= len(columns):
             continue
         next_norm = norm[i + 1]
-        if not any(x in next_norm for x in ["comment", "commentaire", "remarque", "avis"]):
-            # Si la colonne suivante n'est pas un commentaire, ignorer cette paire
+        if not any(key in next_norm for key in COMMENT_KEYWORDS):
+            # La colonne suivante n'est pas un commentaire : on ignore
             continue
 
-        # 3) Extraire une clé catégorie depuis la "queue" de l'en-tête
+        # 3) Extraire une « queue » de catégorie depuis la question d'échelle
         cat_tail = _extract_category_from_scale_header(ncol)
         cat_key_simple = re.sub(r"[^a-z0-9 ]", "", cat_tail)
         cat_key_simple = re.sub(r"\s+", "", cat_key_simple)
 
-        # 4) Faire correspondre aux vues cibles
+        # 4) Essayer de faire correspondre aux vues cibles
         match_key = None
         for tk in target_keys:
             if tk in cat_key_simple or cat_key_simple in tk:
                 match_key = tk
                 break
         if match_key is None:
-            # Correspondance plus permissive : partage de mots
+            # Correspondance permissive : partage d'au moins un mot
             for tk in target_keys:
                 words = re.findall(r"[a-z]+", tk)
                 if any(w in cat_key_simple for w in words):
                     match_key = tk
                     break
 
-        if match_key:
-            disp = display_map[match_key]
-            pairs[disp] = (columns[i], columns[i + 1])
+        display = display_map.get(match_key) if match_key else None
+        if display:
+            pairs[display] = (columns[i], columns[i + 1])
 
     return pairs
 
 def compute_averages(df: pd.DataFrame, pairs: dict) -> pd.DataFrame:
+    """Calcule la moyenne /5 pour chaque catégorie détectée."""
     rows = []
     for view, (scale_col, _) in pairs.items():
-        series = df[scale_col].map(parse_note)
-        series = series.dropna()
+        series = df[scale_col].map(parse_note).dropna()
         if not series.empty:
             rows.append({"Catégorie": view, "Moyenne (/5)": round(float(series.mean()), 2)})
-    return pd.DataFrame(rows).sort_values("Catégorie").reset_index(drop=True) if rows else pd.DataFrame(columns=["Catégorie", "Moyenne (/5)"])
+    if not rows:
+        return pd.DataFrame(columns=["Catégorie", "Moyenne (/5)"])
+    return pd.DataFrame(rows).sort_values("Catégorie").reset_index(drop=True)
 
 def build_views(df: pd.DataFrame, prenom_col: str, nom_col: str, email_col: str, pairs: dict):
+    """
+    Construit les DataFrames filtrés (Note < 3/5) par catégorie.
+    Renvoie un dict { "Nom de vue": DataFrame }
+    """
     sheets = {}
     for display, (scale_col, comm_col) in pairs.items():
         cols = [c for c in [prenom_col, nom_col, email_col, scale_col, comm_col] if c and c in df.columns]
@@ -240,9 +267,12 @@ def build_views(df: pd.DataFrame, prenom_col: str, nom_col: str, email_col: str,
     return sheets
 
 def generate_excel(df_avg: pd.DataFrame, sheets: dict) -> bytes:
+    """Génère un classeur Excel en mémoire avec l’onglet Moyennes + 5 vues."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        # Moyennes
         df_avg.to_excel(writer, sheet_name="Moyennes", index=False)
+        # Vues cibles
         for view in ["Coaching", "Fiches de cours", "Professeurs", "Plateforme", "Organisation générale"]:
             df_view = sheets.get(view, pd.DataFrame(columns=["Prénom", "Nom", "Email", "Note", "Commentaire"]))
             df_view.to_excel(writer, sheet_name=view[:31], index=False)
@@ -272,7 +302,7 @@ if not uploaded:
 
 df = read_all_sheets(uploaded)
 if df.empty:
-    st.error("Impossible de lire des données depuis ce fichier. Vérifie le format et les dépendances (openpyxl, pandas-calamine ou xlrd<=1.2.0).")
+    st.error("Impossible de lire des données depuis ce fichier. Vérifie le format et l’installation des moteurs (pandas-calamine ou openpyxl).")
     st.stop()
 
 # Détection identité & paires
