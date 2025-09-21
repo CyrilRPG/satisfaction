@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Streamlit App: Vues Feedback (Moyennes + Vues filtrées <3/5)
-# ──────────────────────────────────────────────────────────────────────────────
-# - Upload un Excel (une ou plusieurs feuilles).
-# - Détecte automatiquement les paires (Échelle 0–5 → Commentaire) :
-#     * La colonne de note DOIT commencer par "Sur une échelle de 0 à 5 ..."
-#     * Le commentaire est la colonne IMMÉDIATEMENT suivante.
-# - Calcule la vue "Moyennes" (moyenne /5) par catégorie.
-# - Construit 5 vues (<3/5) : Coaching, Fiches de cours, Professeurs,
-#   Plateforme, Organisation générale.
-# - Permet de télécharger un Excel qui contient Moyennes + ces 5 vues.
-# - Lecture Excel robuste : essaie calamine → openpyxl → auto.
-# ──────────────────────────────────────────────────────────────────────────────
+"""
+Génère un Excel avec:
+- Onglet "Moyennes" (moyenne sur 5 par catégorie)
+- 5 vues filtrées (<3/5): Coaching, Fiches de cours, Professeurs, Plateforme, Organisation générale
 
-import io
+Règle de couplage:
+- Pour chaque colonne "Note …" OU "Sur une échelle de 0 à 5 …",
+  on rattache le **Commentaire** trouvé dans l'une des 2 colonnes suivantes.
+
+Usage:
+    python vues_feedback_cli.py -i "export.xlsx" -o "vues_feedback.xlsx"
+
+Options (facultatives):
+    --prenom "Prénom" --nom "Nom" --email "Email"
+pour forcer les noms de colonnes d’identité si la détection automatique échoue.
+"""
+
+import argparse
 import re
+import sys
 import unicodedata
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
-import streamlit as st
 
-st.set_page_config(page_title="Vues Feedback – Diploma Santé", layout="wide")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Config / Constantes
-# ──────────────────────────────────────────────────────────────────────────────
-
-# Catégories cibles (clés normalisées → libellés affichés)
+# Clés de catégories (normalisées) → libellés d’affichage
 TARGET_VIEWS = [
     ("coaching", "Coaching"),
     ("fichesdecours", "Fiches de cours"),
@@ -37,28 +37,10 @@ TARGET_VIEWS = [
     ("organisationgenerale", "Organisation générale"),
     ("organisation generale", "Organisation générale"),
 ]
+REQUIRED_SHEETS = ["Moyennes", "Coaching", "Fiches de cours", "Professeurs", "Plateforme", "Organisation générale"]
 
-REQUIRED_SHEETS = [
-    "Moyennes",
-    "Coaching",
-    "Fiches de cours",
-    "Professeurs",
-    "Plateforme",
-    "Organisation générale",
-]
-
-# Préfixe d’en-tête pour les colonnes de note — version normalisée (sans accents)
-SCALE_PREFIX = "sur une echelle de 0 a 5"
-
-# Mots-clés pour repérer la colonne de commentaire
-COMMENT_KEYWORDS = ("comment", "commentaire", "remarque", "avis")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
 
 def normalize(s: str) -> str:
-    """Normalise texte : retire accents, met en minuscules, compacte espaces."""
     if s is None:
         return ""
     s = str(s)
@@ -68,186 +50,167 @@ def normalize(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
-def parse_note(val):
-    """
-    Convertit la note en float sur 5.
-    Accepte :
+
+def parse_note(val) -> Optional[float]:
+    """Convertit une note en float sur 5.
+    Accepte:
       - '2/5', '4 / 5'
-      - '2,5', '3', '4.0'
-      - '4 - Plutôt satisfait', '5 – Très bien' (extrait le 1er nombre)
+      - '2,5', '3' (déjà sur 5)
+      - '4 - Satisfait', '5: Très bien' (prend le nombre initial)
     """
     if pd.isna(val):
         return None
-    s = str(val).strip().replace(",", ".")
-    # Forme fractionnaire n/den
-    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*$", s)
+    s = str(val).strip()
+
+    # 1) Forme fraction
+    m = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)\s*$", s)
     if m:
-        num = float(m.group(1))
-        den = float(m.group(2))
+        num = float(m.group(1).replace(",", "."))
+        den = float(m.group(2).replace(",", "."))
         return (num / den) * 5.0 if den else None
-    # Nombre simple
+
+    # 2) Nombre simple
     try:
-        return float(s)
+        return float(s.replace(",", "."))
     except ValueError:
-        # Extraire le premier nombre rencontré (ex: "4 - Très bien")
-        m2 = re.search(r"(\d+(?:\.\d+)?)", s)
-        if m2:
-            try:
-                return float(m2.group(1))
-            except Exception:
-                return None
-        return None
+        pass
 
-def _try_read_excel_all_sheets(bio: io.BytesIO):
-    """
-    Essaie plusieurs moteurs pour éviter les ImportError.
-    Ordre recommandé : calamine (rapide, .xlsx/.xls) → openpyxl (.xlsx) → auto.
-    Nécessite :
-      - pandas-calamine >= 0.2.0 pour 'calamine'
-      - openpyxl pour .xlsx (si pas de calamine)
-    """
-    engines = ["calamine", "openpyxl", None]
-    last_err = None
-    for eng in engines:
+    # 3) Nombre en tête de chaîne (ex: "4 - Plutôt satisfait")
+    m2 = re.match(r"^\s*(\d+(?:[.,]\d+)?)", s)
+    if m2:
+        return float(m2.group(1).replace(",", "."))
+
+    return None
+
+
+def read_all_sheets(path: Path) -> pd.DataFrame:
+    """Lit toutes les feuilles d’un Excel et concatène."""
+    try:
+        # Essaye openpyxl pour .xlsx ; fallback sinon
         try:
-            bio.seek(0)
-            if eng is None:
-                return pd.read_excel(bio, sheet_name=None)
-            return pd.read_excel(bio, sheet_name=None, engine=eng)
-        except Exception as e:
-            last_err = e
-            continue
-    # Si aucun moteur ne fonctionne, on remonte l'erreur
-    raise last_err if last_err else RuntimeError("Lecture Excel impossible.")
-
-def read_all_sheets(uploaded_file) -> pd.DataFrame:
-    """
-    Lit toutes les feuilles d’un Excel uploadé et les concatène.
-    Robuste aux environnements sans openpyxl : essaie plusieurs moteurs.
-    """
-    # Sur Streamlit Cloud, getvalue() est plus fiable que read()
-    try:
-        bytes_data = uploaded_file.getvalue()
-    except Exception:
-        bytes_data = uploaded_file.read()
-
-    if not bytes_data:
-        return pd.DataFrame()
-
-    bio = io.BytesIO(bytes_data)
-    try:
-        sheets = _try_read_excel_all_sheets(bio)
+            xls = pd.ExcelFile(path, engine="openpyxl")
+        except Exception:
+            xls = pd.ExcelFile(path)
+        frames: List[pd.DataFrame] = []
+        for sheet in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sheet)
+            if not df.empty:
+                df["_source_sheet"] = sheet
+                frames.append(df)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     except Exception as e:
-        st.error(
-            "Impossible de lire le fichier Excel. "
-            "Assure-toi d’installer au déploiement : `pandas-calamine` (conseillé) "
-            "ou `openpyxl`.\n\nDétails techniques : {}".format(e)
-        )
-        st.exception(e)
-        return pd.DataFrame()
+        raise RuntimeError(f"Erreur lecture Excel: {e}")
 
-    frames = []
-    for sheet_name, df in sheets.items():
-        if df is not None and not df.empty:
-            df["_source_sheet"] = str(sheet_name)
-            frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-def find_identity_columns(df: pd.DataFrame):
-    """Détecte Prénom / Nom / Email par heuristiques de noms de colonnes."""
+def find_identity_columns(df: pd.DataFrame,
+                          forced_prenom: Optional[str],
+                          forced_nom: Optional[str],
+                          forced_email: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    if forced_prenom or forced_nom or forced_email:
+        return forced_prenom, forced_nom, forced_email
+
     cols = {normalize(c): c for c in df.columns}
+
     first_name = next((cols[k] for k in cols if any(w in k for w in ["prenom", "prénom", "first name", "given name"])), None)
     last_name  = next((cols[k] for k in cols if any(w in k for w in ["nom", "last name", "surname", "family name"]) and "prenom" not in k and "prénom" not in k), None)
     email      = next((cols[k] for k in cols if any(w in k for w in ["email", "e-mail", "mail", "adresse email", "adresse e mail"])), None)
+
     if first_name is None:
         first_name = next((cols[k] for k in cols if "prenom" in k or "prénom" in k), None)
     if last_name is None:
         last_name = next((cols[k] for k in cols if k.startswith("nom")), None)
     if email is None:
         email = next((cols[k] for k in cols if "adresse" in k and "mail" in k), None)
+
     return first_name, last_name, email
 
-def _extract_category_from_scale_header(norm_header: str) -> str:
-    """
-    Reçoit un en-tête déjà normalisé.
-    Si l’en-tête commence par 'sur une echelle de 0 a 5', renvoie la partie
-    après ce préfixe (nettoyée).
-    """
-    if not norm_header.startswith(SCALE_PREFIX):
-        return ""
-    tail = norm_header[len(SCALE_PREFIX):].strip(" :–—-")
-    tail = re.sub(r"\s+", " ", tail)
-    return tail
 
-def build_pairs(df: pd.DataFrame):
-    """
-    Détecte les colonnes où une question commence par 'Sur une échelle de 0 à 5 ...'
-    et où la colonne immédiatement suivante est le commentaire.
-    Retourne: dict { display_name: (scale_col, comment_col) }
+def _is_comment_col(n: str) -> bool:
+    return any(x in n for x in ["comment", "commentaire", "remarque", "avis"])
+
+
+def build_pairs(df: pd.DataFrame) -> Dict[str, Tuple[str, str]]:
+    """Détecte les paires (ColonneNoteOuEchelle, ColonneCommentaireSuivante) par catégorie.
+    Retourne dict { 'Coaching': ('<col note/echelle>', '<col commentaire>'), ... }
     """
     columns = list(df.columns)
     norm = [normalize(c) for c in columns]
     target_keys = {k for k, _ in TARGET_VIEWS}
     display_map = {k: disp for k, disp in TARGET_VIEWS}
-    pairs = {}
+    pairs: Dict[str, Tuple[str, str]] = {}
 
     for i, ncol in enumerate(norm):
-        # 1) Repérer les colonnes de note (préfixe exact après normalisation)
-        if not ncol.startswith(SCALE_PREFIX):
+        # Candidat "Note …"
+        is_note = "note" in ncol
+        # Candidat "Sur une échelle de 0 à 5 …" (robuste aux accents)
+        is_scale = (
+            ncol.startswith("sur une echelle de 0 a 5") or
+            ncol.startswith("sur une echelle 0 a 5") or
+            "echelle de 0 a 5" in ncol
+        )
+
+        if not (is_note or is_scale):
             continue
 
-        # 2) La colonne suivante est censée être le commentaire
-        if i + 1 >= len(columns):
-            continue
-        next_norm = norm[i + 1]
-        if not any(key in next_norm for key in COMMENT_KEYWORDS):
-            # La colonne suivante n'est pas un commentaire : on ignore
+        # Cherche la colonne de commentaire dans les 2 colonnes suivantes
+        comment_col = None
+        for j in (i + 1, i + 2):
+            if j < len(columns) and _is_comment_col(norm[j]):
+                comment_col = columns[j]
+                break
+        if comment_col is None:
             continue
 
-        # 3) Extraire une « queue » de catégorie depuis la question d'échelle
-        cat_tail = _extract_category_from_scale_header(ncol)
-        cat_key_simple = re.sub(r"[^a-z0-9 ]", "", cat_tail)
+        # Extraire un "cat_key" depuis l'en-tête pour mapper à nos 5 vues
+        if is_note:
+            base = re.sub(r"\bnote\b|:|-|–|—", " ", ncol)
+        else:
+            # Retire le préfixe "sur une echelle de 0 a 5"
+            base = re.sub(r"^sur une echelle( de)? 0 a 5", " ", ncol)
+        cat_key = normalize(base)
+        cat_key_simple = re.sub(r"[^a-z0-9 ]", "", cat_key)
         cat_key_simple = re.sub(r"\s+", "", cat_key_simple)
 
-        # 4) Essayer de faire correspondre aux vues cibles
         match_key = None
         for tk in target_keys:
             if tk in cat_key_simple or cat_key_simple in tk:
                 match_key = tk
                 break
         if match_key is None:
-            # Correspondance permissive : partage d'au moins un mot
             for tk in target_keys:
-                words = re.findall(r"[a-z]+", tk)
-                if any(w in cat_key_simple for w in words):
+                if any(w in cat_key_simple for w in re.findall(r"[a-z]+", tk)):
                     match_key = tk
                     break
+        if not match_key:
+            # Si on ne parvient pas à mapper la catégorie, on ignore ce couple
+            continue
 
-        display = display_map.get(match_key) if match_key else None
-        if display:
-            pairs[display] = (columns[i], columns[i + 1])
+        display = display_map[match_key]
+        pairs[display] = (columns[i], comment_col)
 
     return pairs
 
-def compute_averages(df: pd.DataFrame, pairs: dict) -> pd.DataFrame:
-    """Calcule la moyenne /5 pour chaque catégorie détectée."""
+
+def compute_averages(df: pd.DataFrame, pairs: Dict[str, Tuple[str, str]]) -> pd.DataFrame:
     rows = []
-    for view, (scale_col, _) in pairs.items():
-        series = df[scale_col].map(parse_note).dropna()
+    for view, (note_col, _) in pairs.items():
+        series = df[note_col].map(parse_note)
+        series = series.dropna()
         if not series.empty:
             rows.append({"Catégorie": view, "Moyenne (/5)": round(float(series.mean()), 2)})
     if not rows:
         return pd.DataFrame(columns=["Catégorie", "Moyenne (/5)"])
     return pd.DataFrame(rows).sort_values("Catégorie").reset_index(drop=True)
 
-def build_views(df: pd.DataFrame, prenom_col: str, nom_col: str, email_col: str, pairs: dict):
-    """
-    Construit les DataFrames filtrés (Note < 3/5) par catégorie.
-    Renvoie un dict { "Nom de vue": DataFrame }
-    """
-    sheets = {}
-    for display, (scale_col, comm_col) in pairs.items():
-        cols = [c for c in [prenom_col, nom_col, email_col, scale_col, comm_col] if c and c in df.columns]
+
+def build_views(df: pd.DataFrame,
+                prenom_col: Optional[str],
+                nom_col: Optional[str],
+                email_col: Optional[str],
+                pairs: Dict[str, Tuple[str, str]]) -> Dict[str, pd.DataFrame]:
+    sheets: Dict[str, pd.DataFrame] = {}
+    for display, (note_col, comm_col) in pairs.items():
+        cols = [c for c in [prenom_col, nom_col, email_col, note_col, comm_col] if c and c in df.columns]
         if not cols:
             continue
         temp = df[cols].copy()
@@ -255,8 +218,8 @@ def build_views(df: pd.DataFrame, prenom_col: str, nom_col: str, email_col: str,
         if prenom_col in temp.columns: rename_map[prenom_col] = "Prénom"
         if nom_col in temp.columns:    rename_map[nom_col]    = "Nom"
         if email_col in temp.columns:  rename_map[email_col]  = "Email"
-        rename_map[scale_col] = "Note"
-        rename_map[comm_col]  = "Commentaire"
+        rename_map[note_col] = "Note"
+        rename_map[comm_col] = "Commentaire"
         temp.rename(columns=rename_map, inplace=True)
         if "Note" not in temp.columns:
             continue
@@ -266,96 +229,68 @@ def build_views(df: pd.DataFrame, prenom_col: str, nom_col: str, email_col: str,
         sheets[display] = temp[ordered]
     return sheets
 
-def generate_excel(df_avg: pd.DataFrame, sheets: dict) -> bytes:
-    """Génère un classeur Excel en mémoire avec l’onglet Moyennes + 5 vues."""
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        # Moyennes
+
+def write_output(output_path: Path, df_avg: pd.DataFrame, sheets: Dict[str, pd.DataFrame]) -> None:
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
         df_avg.to_excel(writer, sheet_name="Moyennes", index=False)
-        # Vues cibles
         for view in ["Coaching", "Fiches de cours", "Professeurs", "Plateforme", "Organisation générale"]:
             df_view = sheets.get(view, pd.DataFrame(columns=["Prénom", "Nom", "Email", "Note", "Commentaire"]))
             df_view.to_excel(writer, sheet_name=view[:31], index=False)
-    output.seek(0)
-    return output.getvalue()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# UI
-# ──────────────────────────────────────────────────────────────────────────────
 
-st.title("📊 Vues Feedback – Générateur d’Excel")
-st.write(
-    "Dépose ton export Excel, calcule les **moyennes** par catégorie et récupère **5 vues filtrées (< 3/5)**.\n\n"
-    "ℹ️ Hypothèse : chaque **commentaire** est **immédiatement après** la colonne dont l’en-tête **commence par** "
-    "“Sur une échelle de 0 à 5 …”."
-)
+def main():
+    parser = argparse.ArgumentParser(description="Génère un Excel 'Moyennes + Vues (<3/5)' à partir d’un export.")
+    parser.add_argument("-i", "--input", required=True, help="Chemin du fichier Excel source (xlsx/xls).")
+    parser.add_argument("-o", "--output", default="vues_feedback.xlsx", help="Chemin du fichier Excel de sortie.")
+    parser.add_argument("--prenom", help="Nom exact de la colonne Prénom (optionnel).")
+    parser.add_argument("--nom", help="Nom exact de la colonne Nom (optionnel).")
+    parser.add_argument("--email", help="Nom exact de la colonne Email (optionnel).")
+    args = parser.parse_args()
 
-uploaded = st.file_uploader(
-    "Dépose ton fichier Excel (.xlsx ou .xls)",
-    type=["xlsx", "xls"],
-    accept_multiple_files=False
-)
+    in_path = Path(args.input)
+    out_path = Path(args.output)
 
-if not uploaded:
-    st.info("🔺 Dépose un fichier pour commencer.")
-    st.stop()
+    if not in_path.exists():
+        print(f"Erreur: fichier introuvable: {in_path}", file=sys.stderr)
+        sys.exit(1)
 
-df = read_all_sheets(uploaded)
-if df.empty:
-    st.error("Impossible de lire des données depuis ce fichier. Vérifie le format et l’installation des moteurs (pandas-calamine ou openpyxl).")
-    st.stop()
+    # Lecture
+    df = read_all_sheets(in_path)
+    if df.empty:
+        print("Erreur: aucune donnée lisible dans le fichier source.", file=sys.stderr)
+        sys.exit(1)
 
-# Détection identité & paires
-prenom_col, nom_col, email_col = find_identity_columns(df)
-pairs = build_pairs(df)
+    # Colonnes identité + paires
+    prenom_col, nom_col, email_col = find_identity_columns(df, args.prenom, args.nom, args.email)
+    pairs = build_pairs(df)
 
-with st.expander("🔎 Colonnes détectées", expanded=False):
-    st.write("**Prénom** :", prenom_col or "non détecté")
-    st.write("**Nom** :", nom_col or "non détecté")
-    st.write("**Email** :", email_col or "non détecté")
-    st.write("**Paires (Échelle 0–5 → Commentaire)** :")
-    if pairs:
-        st.json({k: {"Echelle 0–5": v[0], "Commentaire": v[1]} for k, v in pairs.items()})
-    else:
-        st.warning(
-            "Aucune paire détectée. Vérifie que l’en-tête de la **colonne de note** "
-            "commence bien par **“Sur une échelle de 0 à 5”** et que la **colonne suivante** est le **commentaire**."
-        )
+    if not pairs:
+        print("Erreur: aucune paire détectée. "
+              "Astuce: pour chaque catégorie, mets un commentaire dans l'une des 2 colonnes suivant "
+              "la colonne 'Note …' ou 'Sur une échelle de 0 à 5 …'.",
+              file=sys.stderr)
+        # Affiche un aperçu des en-têtes pour debug rapide
+        for c in df.columns:
+            print(f"- {c}", file=sys.stderr)
+        sys.exit(1)
 
-if not pairs:
-    st.stop()
+    # Moyennes + vues filtrées
+    df_avg = compute_averages(df, pairs)
+    sheets = build_views(df, prenom_col, nom_col, email_col, pairs)
 
-# Moyennes
-df_avg = compute_averages(df, pairs)
-st.subheader("📈 Moyennes par catégorie (/5)")
-st.dataframe(df_avg, use_container_width=True)
-if not df_avg.empty:
-    chart_df = df_avg.set_index("Catégorie")["Moyenne (/5)"]
-    st.bar_chart(chart_df)
+    # Écriture
+    write_output(out_path, df_avg, sheets)
 
-# Vues filtrées < 3/5
-sheets = build_views(df, prenom_col, nom_col, email_col, pairs)
+    # Résumé console
+    print(f"✅ Fichier généré: {out_path}")
+    print("Feuilles écrites:", ", ".join(REQUIRED_SHEETS))
+    if prenom_col or nom_col or email_col:
+        print("Colonnes identité détectées/forcées:",
+              f"Prénom={prenom_col or '-'} | Nom={nom_col or '-'} | Email={email_col or '-'}")
+    print("Paires (colonne de note/échelle → commentaire):")
+    for k, (ncol, ccol) in pairs.items():
+        print(f"  - {k}: Note/Echelle='{ncol}'  |  Commentaire='{ccol}'")
 
-tabs = st.tabs(REQUIRED_SHEETS)
-with tabs[0]:
-    st.markdown("**Moyennes** par catégorie (sur 5).")
-    st.dataframe(df_avg, use_container_width=True)
 
-view_names = ["Coaching", "Fiches de cours", "Professeurs", "Plateforme", "Organisation générale"]
-for i, view in enumerate(view_names, start=1):
-    with tabs[i]:
-        st.markdown(f"**{view}** – élèves avec **Note < 3/5**")
-        df_view = sheets.get(view, pd.DataFrame(columns=["Prénom", "Nom", "Email", "Note", "Commentaire"]))
-        st.dataframe(df_view, use_container_width=True)
-
-# Export Excel
-xls_bytes = generate_excel(df_avg, sheets)
-st.download_button(
-    "📥 Télécharger l’Excel (Moyennes + Vues)",
-    data=xls_bytes,
-    file_name="vues_feedback.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True
-)
-
-st.caption("ℹ️ Le **commentaire** est **toujours** la colonne immédiatement **après** la colonne dont l’en-tête commence par “Sur une échelle de 0 à 5 …”.")
+if __name__ == "__main__":
+    main()
