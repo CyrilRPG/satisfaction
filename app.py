@@ -8,26 +8,17 @@
 # - Construit 5 vues (<3/5) : Coaching, Fiches de cours, Professeurs,
 #   Plateforme, Organisation générale.
 # - Permet de télécharger un Excel qui contient Moyennes + ces 5 vues.
-#
-# Points pensés pour éviter le "the app is in the oven" :
-#   • Pas d’opérations lourdes au niveau import
-#   • Cache du parsing avec @st.cache_data
-#   • Gestion d’erreurs explicite, pas de boucles bloquantes
 # ──────────────────────────────────────────────────────────────────────────────
 
 import io
 import re
 import unicodedata
 import pandas as pd
-import numpy as np
 import streamlit as st
 
 st.set_page_config(page_title="Vues Feedback – Diploma Santé", layout="wide")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Constantes
-# ──────────────────────────────────────────────────────────────────────────────
-
+# Catégories cibles (clés normalisées → libellés affichés)
 TARGET_VIEWS = [
     ("coaching", "Coaching"),
     ("fichesdecours", "Fiches de cours"),
@@ -38,7 +29,14 @@ TARGET_VIEWS = [
     ("organisation generale", "Organisation générale"),
 ]
 
-REQUIRED_SHEETS = ["Moyennes", "Coaching", "Fiches de cours", "Professeurs", "Plateforme", "Organisation générale"]
+REQUIRED_SHEETS = [
+    "Moyennes",
+    "Coaching",
+    "Fiches de cours",
+    "Professeurs",
+    "Plateforme",
+    "Organisation générale",
+]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -56,36 +54,41 @@ def normalize(s: str) -> str:
 
 def parse_note(val):
     """
-    Convertit la note en numérique sur 5.
+    Convertit la note en float sur 5.
     Accepte : '2/5', '4 / 5', '2,5', '3'
     """
     if pd.isna(val):
-        return np.nan
+        return None
     s = str(val).strip().replace(",", ".")
     m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*$", s)
     if m:
-        num, den = float(m.group(1)), float(m.group(2))
-        if den != 0:
-            return (num / den) * 5.0
-        return np.nan
+        num = float(m.group(1))
+        den = float(m.group(2))
+        return (num / den) * 5.0 if den else None
     try:
         return float(s)
     except ValueError:
-        return np.nan
+        return None
 
-@st.cache_data(show_spinner=False)
-def read_all_sheets(file_bytes: bytes) -> pd.DataFrame:
+def read_all_sheets(uploaded_file) -> pd.DataFrame:
     """
-    Lit toutes les feuilles d’un Excel (bytes) et les concatène.
-    Mise en cache pour éviter les relectures à chaque rerun.
+    Lit toutes les feuilles d’un Excel uploadé et les concatène.
+    Utilise openpyxl si possible (xlsx), sinon fallback.
     """
-    bio = io.BytesIO(file_bytes)
-    xls = pd.ExcelFile(bio)
+    bytes_data = uploaded_file.read()
+    if not bytes_data:
+        return pd.DataFrame()
+    bio = io.BytesIO(bytes_data)
+    try:
+        # .xlsx recommandé : moteur openpyxl
+        sheets = pd.read_excel(bio, sheet_name=None, engine="openpyxl")
+    except Exception:
+        bio.seek(0)
+        sheets = pd.read_excel(bio, sheet_name=None)  # fallback générique
     frames = []
-    for sheet in xls.sheet_names:
-        df = pd.read_excel(xls, sheet_name=sheet)
-        if not df.empty:
-            df["_source_sheet"] = sheet
+    for sheet_name, df in sheets.items():
+        if df is not None and not df.empty:
+            df["_source_sheet"] = str(sheet_name)
             frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
@@ -94,7 +97,6 @@ def find_identity_columns(df: pd.DataFrame):
     first_name = next((cols[k] for k in cols if any(w in k for w in ["prenom", "prénom", "first name", "given name"])), None)
     last_name  = next((cols[k] for k in cols if any(w in k for w in ["nom", "last name", "surname", "family name"]) and "prenom" not in k and "prénom" not in k), None)
     email      = next((cols[k] for k in cols if any(w in k for w in ["email", "e-mail", "mail", "adresse email", "adresse e mail"])), None)
-    # Fallbacks
     if first_name is None:
         first_name = next((cols[k] for k in cols if "prenom" in k or "prénom" in k), None)
     if last_name is None:
@@ -117,10 +119,10 @@ def build_pairs(df: pd.DataFrame):
         if "note" in ncol and i + 1 < len(columns):
             next_norm = norm[i + 1]
             if any(x in next_norm for x in ["comment", "commentaire", "remarque", "avis"]):
+                # extraire la clé de catégorie depuis l'intitulé de la note
                 cat_key = normalize(re.sub(r"\bnote\b|:|-|–|—", " ", ncol)).replace("note", "").strip()
                 cat_key_simple = re.sub(r"[^a-z0-9 ]", "", cat_key)
                 cat_key_simple = re.sub(r"\s+", "", cat_key_simple)
-
                 match_key = None
                 for tk in target_keys:
                     if tk in cat_key_simple or cat_key_simple in tk:
@@ -128,8 +130,7 @@ def build_pairs(df: pd.DataFrame):
                         break
                 if match_key is None:
                     for tk in target_keys:
-                        words = re.findall(r"[a-z]+", tk)
-                        if any(w in cat_key_simple for w in words):
+                        if any(w in cat_key_simple for w in re.findall(r"[a-z]+", tk)):
                             match_key = tk
                             break
                 if match_key:
@@ -138,28 +139,25 @@ def build_pairs(df: pd.DataFrame):
     return pairs
 
 def compute_averages(df: pd.DataFrame, pairs: dict) -> pd.DataFrame:
-    data = []
+    rows = []
     for view, (note_col, _) in pairs.items():
         series = df[note_col].map(parse_note)
-        if series.notna().any():
-            mean_val = series.mean()
-            data.append({"Catégorie": view, "Moyenne (/5)": round(float(mean_val), 2)})
-    if not data:
-        return pd.DataFrame(columns=["Catégorie", "Moyenne (/5)"])
-    df_avg = pd.DataFrame(data).sort_values("Catégorie").reset_index(drop=True)
-    return df_avg
+        series = series.dropna()
+        if not series.empty:
+            rows.append({"Catégorie": view, "Moyenne (/5)": round(float(series.mean()), 2)})
+    return pd.DataFrame(rows).sort_values("Catégorie").reset_index(drop=True) if rows else pd.DataFrame(columns=["Catégorie", "Moyenne (/5)"])
 
 def build_views(df: pd.DataFrame, prenom_col: str, nom_col: str, email_col: str, pairs: dict):
     sheets = {}
     for display, (note_col, comm_col) in pairs.items():
-        cols = [c for c in [prenom_col, nom_col, email_col, note_col, comm_col] if c is not None and c in df.columns]
+        cols = [c for c in [prenom_col, nom_col, email_col, note_col, comm_col] if c and c in df.columns]
         if not cols:
             continue
         temp = df[cols].copy()
         rename_map = {}
-        if prenom_col and prenom_col in temp.columns: rename_map[prenom_col] = "Prénom"
-        if nom_col and nom_col in temp.columns:       rename_map[nom_col]    = "Nom"
-        if email_col and email_col in temp.columns:   rename_map[email_col]  = "Email"
+        if prenom_col in temp.columns: rename_map[prenom_col] = "Prénom"
+        if nom_col in temp.columns:    rename_map[nom_col]    = "Nom"
+        if email_col in temp.columns:  rename_map[email_col]  = "Email"
         rename_map[note_col] = "Note"
         rename_map[comm_col] = "Commentaire"
         temp.rename(columns=rename_map, inplace=True)
@@ -174,10 +172,7 @@ def build_views(df: pd.DataFrame, prenom_col: str, nom_col: str, email_col: str,
 def generate_excel(df_avg: pd.DataFrame, sheets: dict) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        # Moyennes en premier
-        (df_avg if df_avg is not None else pd.DataFrame(columns=["Catégorie", "Moyenne (/5)"])) \
-            .to_excel(writer, sheet_name="Moyennes", index=False)
-        # Autres vues (même si vides)
+        df_avg.to_excel(writer, sheet_name="Moyennes", index=False)
         for view in ["Coaching", "Fiches de cours", "Professeurs", "Plateforme", "Organisation générale"]:
             df_view = sheets.get(view, pd.DataFrame(columns=["Prénom", "Nom", "Email", "Note", "Commentaire"]))
             df_view.to_excel(writer, sheet_name=view[:31], index=False)
@@ -190,30 +185,25 @@ def generate_excel(df_avg: pd.DataFrame, sheets: dict) -> bytes:
 
 st.title("📊 Vues Feedback – Générateur d’Excel")
 st.write("Dépose ton export Excel, calcule les **moyennes** par catégorie et récupère **5 vues filtrées (< 3/5)**.")
-uploaded = st.file_uploader("Dépose ton fichier Excel (xlsx ou xls)", type=["xlsx", "xls"], accept_multiple_files=False)
+
+uploaded = st.file_uploader(
+    "Dépose ton fichier Excel (.xlsx de préférence ; .xls accepté)",
+    type=["xlsx", "xls"],
+    accept_multiple_files=False
+)
 
 if not uploaded:
     st.info("🔺 Dépose un fichier pour commencer.")
     st.stop()
 
-try:
-    file_bytes = uploaded.read()
-    if not file_bytes:
-        st.error("Le fichier semble vide.")
-        st.stop()
-    df = read_all_sheets(file_bytes)
-except Exception as e:
-    st.error(f"Erreur lors de la lecture : {e}")
-    st.stop()
-
+df = read_all_sheets(uploaded)
 if df.empty:
-    st.warning("Aucune donnée lisible n’a été trouvée dans le fichier.")
+    st.error("Impossible de lire des données depuis ce fichier. Vérifie le format (idéalement .xlsx).")
     st.stop()
 
 # Détection identité & paires
 prenom_col, nom_col, email_col = find_identity_columns(df)
 pairs = build_pairs(df)
-
 with st.expander("🔎 Colonnes détectées", expanded=False):
     st.write("**Prénom** :", prenom_col or "non détecté")
     st.write("**Nom** :", nom_col or "non détecté")
@@ -222,7 +212,7 @@ with st.expander("🔎 Colonnes détectées", expanded=False):
     if pairs:
         st.json({k: {"Note": v[0], "Commentaire": v[1]} for k, v in pairs.items()})
     else:
-        st.warning("Aucune paire détectée. Vérifie que le **Commentaire** est **juste après** la **Note**.")
+        st.warning("Aucune paire détectée. Vérifie que la **colonne Commentaire** est **juste après** la **colonne Note**.")
 
 if not pairs:
     st.stop()
@@ -253,7 +243,7 @@ for i, view in enumerate(view_names, start=1):
 # Export Excel
 xls_bytes = generate_excel(df_avg, sheets)
 st.download_button(
-    label="📥 Télécharger l’Excel (Moyennes + Vues)",
+    "📥 Télécharger l’Excel (Moyennes + Vues)",
     data=xls_bytes,
     file_name="vues_feedback.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
