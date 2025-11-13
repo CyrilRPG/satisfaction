@@ -1,32 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Génère un Excel avec:
-- Onglet "Moyennes" en tableau croisé (une colonne par fac)
-- 5 vues filtrées (<3/5): Coaching, Fiches de cours, Professeurs, Plateforme, Organisation générale
-
-Détection fac:
-- À partir des pseudos/identifiants (ex: "DelArmUPC" → UPC).
-- Facs supportées: UPC, UPEC (affiché "UPEC L1"), UPS, UVSQ, SU, USPN.
-- Auto-détection de la colonne pseudo (en-tête contenant 'pseudo', 'identifiant', 'username', 'login').
-  Fallback: on regarde aussi Email / Prénom / Nom si la colonne pseudo n'existe pas.
-- Option CLI: --pseudo "Nom exact de la colonne pseudo" pour forcer.
-
-Règle de couplage des commentaires:
-- Pour chaque colonne "Note …" OU "Sur une échelle de 0 à 5 …",
-  on rattache le **Commentaire** trouvé dans l'une des 2 colonnes suivantes.
-
-Usage:
-    python vues_feedback_cli.py -i "export.xlsx" -o "vues_feedback.xlsx"
-    # avec colonne pseudo forcée:
-    python vues_feedback_cli.py -i "export.xlsx" -o "vues_feedback.xlsx" --pseudo "Pseudo"
-
-Options (facultatives):
-    --prenom "Prénom" --nom "Nom" --email "Email" --pseudo "Pseudo"
-pour forcer les noms de colonnes si la détection automatique échoue.
-"""
-
 import argparse
 import re
 import sys
@@ -36,7 +10,8 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-# Clés de catégories (normalisées) → libellés d’affichage
+# ========= CONFIG ========= #
+
 TARGET_VIEWS = [
     ("coaching", "Coaching"),
     ("fichesdecours", "Fiches de cours"),
@@ -46,12 +21,34 @@ TARGET_VIEWS = [
     ("organisationgenerale", "Organisation générale"),
     ("organisation generale", "Organisation générale"),
 ]
-REQUIRED_SHEETS = ["Moyennes", "Coaching", "Fiches de cours", "Professeurs", "Plateforme", "Organisation générale"]
 
-# Facs: nom interne -> libellé à afficher dans "Moyennes"
+REQUIRED_SHEETS = [
+    "Moyennes",
+    "Coaching",
+    "Fiches de cours",
+    "Professeurs",
+    "Plateforme",
+    "Organisation générale",
+    "Commentaires",
+    "Recommandations",
+]
+
 FAC_ORDER = ["UPC", "UPEC", "UPS", "UVSQ", "SU", "USPN"]
-FAC_DISPLAY = {"UPC": "UPC", "UPEC": "UPEC L1", "UPS": "UPS", "UVSQ": "UVSQ", "SU": "SU", "USPN": "USPN"}
+FAC_DISPLAY = {
+    "UPC": "UPC",
+    "UPEC": "UPEC L1",
+    "UPS": "UPS",
+    "UVSQ": "UVSQ",
+    "SU": "SU",
+    "USPN": "USPN",
+}
 
+RECO_COL_EXACT = (
+    "Si vous avez des besoins, des demandes ou des améliorations à proposer avant le concours, écrivez-les ici !"
+)
+
+
+# ========= UTILS ========= #
 
 def normalize(s: str) -> str:
     if s is None:
@@ -59,36 +56,25 @@ def normalize(s: str) -> str:
     s = str(s)
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
-    s = s.lower().strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
+    return re.sub(r"\s+", " ", s.lower().strip())
 
 
 def parse_note(val) -> Optional[float]:
-    """Convertit une note en float sur 5.
-    Accepte:
-      - '2/5', '4 / 5'
-      - '2,5', '3' (déjà sur 5)
-      - '4 - Satisfait', '5: Très bien' (prend le nombre initial)
-    """
     if pd.isna(val):
         return None
     s = str(val).strip()
 
-    # 1) Forme fraction
     m = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)\s*$", s)
     if m:
         num = float(m.group(1).replace(",", "."))
         den = float(m.group(2).replace(",", "."))
         return (num / den) * 5.0 if den else None
 
-    # 2) Nombre simple
     try:
         return float(s.replace(",", "."))
     except ValueError:
         pass
 
-    # 3) Nombre en tête de chaîne (ex: "4 - Plutôt satisfait")
     m2 = re.match(r"^\s*(\d+(?:[.,]\d+)?)", s)
     if m2:
         return float(m2.group(1).replace(",", "."))
@@ -97,14 +83,13 @@ def parse_note(val) -> Optional[float]:
 
 
 def read_all_sheets(path: Path) -> pd.DataFrame:
-    """Lit toutes les feuilles d’un Excel et concatène."""
     try:
-        # Essaye openpyxl pour .xlsx ; fallback sinon
         try:
             xls = pd.ExcelFile(path, engine="openpyxl")
         except Exception:
             xls = pd.ExcelFile(path)
-        frames: List[pd.DataFrame] = []
+
+        frames = []
         for sheet in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet)
             if not df.empty:
@@ -115,274 +100,250 @@ def read_all_sheets(path: Path) -> pd.DataFrame:
         raise RuntimeError(f"Erreur lecture Excel: {e}")
 
 
-def find_identity_columns(df: pd.DataFrame,
-                          forced_prenom: Optional[str],
-                          forced_nom: Optional[str],
-                          forced_email: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def find_identity_columns(df, forced_prenom, forced_nom, forced_email):
     if forced_prenom or forced_nom or forced_email:
         return forced_prenom, forced_nom, forced_email
 
     cols = {normalize(c): c for c in df.columns}
 
-    first_name = next((cols[k] for k in cols if any(w in k for w in ["prenom", "prénom", "first name", "given name"])), None)
-    last_name  = next((cols[k] for k in cols if any(w in k for w in ["nom", "last name", "surname", "family name"]) and "prenom" not in k and "prénom" not in k), None)
-    email      = next((cols[k] for k in cols if any(w in k for w in ["email", "e-mail", "mail", "adresse email", "adresse e mail"])), None)
+    first = next((cols[k] for k in cols if "prenom" in k or "prénom" in k or "first" in k), None)
+    last = next((cols[k] for k in cols if k.startswith("nom") or "last" in k), None)
+    mail = next((cols[k] for k in cols if "mail" in k or "email" in k), None)
 
-    if first_name is None:
-        first_name = next((cols[k] for k in cols if "prenom" in k or "prénom" in k), None)
-    if last_name is None:
-        last_name = next((cols[k] for k in cols if k.startswith("nom")), None)
-    if email is None:
-        email = next((cols[k] for k in cols if "adresse" in k and "mail" in k), None)
-
-    return first_name, last_name, email
+    return first, last, mail
 
 
-def find_pseudo_column(df: pd.DataFrame, forced_pseudo: Optional[str]) -> Optional[str]:
-    """Détecte la colonne pseudo/identifiant si elle existe."""
-    if forced_pseudo and forced_pseudo in df.columns:
-        return forced_pseudo
-
-    candidates = []
+def find_pseudo_column(df, forced):
+    if forced and forced in df.columns:
+        return forced
     for col in df.columns:
-        n = normalize(col)
-        if any(key in n for key in ["pseudo", "identifiant", "username", "login", "user", "id"]):
-            candidates.append(col)
-    # Choix: premier candidat
-    if candidates:
-        return candidates[0]
-    return None  # pas grave: on regardera aussi Email/Prénom/Nom
+        if any(x in normalize(col) for x in ["pseudo", "identifiant", "username", "login"]):
+            return col
+    return None
 
 
-def infer_faculty_from_value(val: str) -> Optional[str]:
-    """Déduit la fac en cherchant les tags 'UPC','UPEC','UPS','UVSQ','SU','USPN' dans une chaîne."""
-    if val is None or (isinstance(val, float) and pd.isna(val)):
+def infer_faculty_from_value(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
         return None
-    s = normalize(val).upper()  # upper après normalisation: 'é' -> 'e' donc OK
-    for fac in FAC_ORDER:
-        if fac in s:
-            return fac
+    s = normalize(v).upper()
+    for f in FAC_ORDER:
+        if f in s:
+            return f
     return None
 
 
-def infer_faculty_for_row(row: pd.Series,
-                          pseudo_col: Optional[str],
-                          prenom_col: Optional[str],
-                          nom_col: Optional[str],
-                          email_col: Optional[str]) -> Optional[str]:
-    """Essaie pseudo, puis email, puis 'Prénom Nom' concaténés pour trouver la fac."""
-    # 1) pseudo
-    if pseudo_col and pseudo_col in row and pd.notna(row[pseudo_col]):
-        fac = infer_faculty_from_value(str(row[pseudo_col]))
-        if fac:
-            return fac
-    # 2) email
-    if email_col and email_col in row and pd.notna(row[email_col]):
-        fac = infer_faculty_from_value(str(row[email_col]))
-        if fac:
-            return fac
-    # 3) concat nom/prenom
-    parts = []
-    if prenom_col and prenom_col in row and pd.notna(row[prenom_col]):
-        parts.append(str(row[prenom_col]))
-    if nom_col and nom_col in row and pd.notna(row[nom_col]):
-        parts.append(str(row[nom_col]))
-    if parts:
-        fac = infer_faculty_from_value(" ".join(parts))
-        if fac:
-            return fac
+def infer_faculty_for_row(row, pseudo_col, prenom_col, nom_col, email_col):
+    if pseudo_col and row.get(pseudo_col):
+        f = infer_faculty_from_value(row[pseudo_col])
+        if f:
+            return f
+    if email_col and row.get(email_col):
+        f = infer_faculty_from_value(row[email_col])
+        if f:
+            return f
+
+    concat = []
+    if prenom_col and row.get(prenom_col): concat.append(str(row[prenom_col]))
+    if nom_col and row.get(nom_col): concat.append(str(row[nom_col]))
+    if concat:
+        return infer_faculty_from_value(" ".join(concat))
+
     return None
 
 
-def _is_comment_col(n: str) -> bool:
+def _is_comment_col(n):
     return any(x in n for x in ["comment", "commentaire", "remarque", "avis"])
 
 
-def build_pairs(df: pd.DataFrame) -> Dict[str, Tuple[str, str]]:
-    """Détecte les paires (ColonneNoteOuEchelle, ColonneCommentaireSuivante) par catégorie.
-    Retourne dict { 'Coaching': ('<col note/echelle>', '<col commentaire>'), ... }
-    """
+# ========= CORE LOGIC ========= #
+
+def build_pairs(df):
     columns = list(df.columns)
     norm = [normalize(c) for c in columns]
+
     target_keys = {k for k, _ in TARGET_VIEWS}
-    display_map = {k: disp for k, disp in TARGET_VIEWS}
-    pairs: Dict[str, Tuple[str, str]] = {}
+    display_map = dict(TARGET_VIEWS)
+    pairs = {}
 
     for i, ncol in enumerate(norm):
-        # Candidat "Note …"
         is_note = "note" in ncol
-        # Candidat "Sur une échelle de 0 à 5 …" (robuste aux accents)
-        is_scale = (
-            ncol.startswith("sur une echelle de 0 a 5") or
-            ncol.startswith("sur une echelle 0 a 5") or
-            "echelle de 0 a 5" in ncol
-        )
+        is_scale = ncol.startswith("sur une echelle") or "echelle de 0 a 5" in ncol
 
         if not (is_note or is_scale):
             continue
 
-        # Cherche la colonne de commentaire dans les 2 colonnes suivantes
-        comment_col = None
+        # commentaire dans les 2 prochaines colonnes
+        comm = None
         for j in (i + 1, i + 2):
             if j < len(columns) and _is_comment_col(norm[j]):
-                comment_col = columns[j]
+                comm = columns[j]
                 break
-        if comment_col is None:
+        if not comm:
             continue
 
-        # Extraire un "cat_key" depuis l'en-tête pour mapper à nos 5 vues
-        if is_note:
-            base = re.sub(r"\bnote\b|:|-|–|—", " ", ncol)
-        else:
-            # Retire le préfixe "sur une echelle de 0 a 5"
-            base = re.sub(r"^sur une echelle( de)? 0 a 5", " ", ncol)
-        cat_key = normalize(base)
-        cat_key_simple = re.sub(r"[^a-z0-9 ]", "", cat_key)
-        cat_key_simple = re.sub(r"\s+", "", cat_key_simple)
+        base = re.sub(r"\bnote\b|:|-", " ", ncol) if is_note else re.sub(r"^sur une echelle( de)? 0 a 5", " ", ncol)
+        cat_key = re.sub(r"\s+", "", re.sub(r"[^a-z0-9 ]", "", normalize(base)))
 
-        match_key = None
+        match = None
         for tk in target_keys:
-            if tk in cat_key_simple or cat_key_simple in tk:
-                match_key = tk
+            if tk in cat_key or cat_key in tk:
+                match = tk
                 break
-        if match_key is None:
-            for tk in target_keys:
-                if any(w in cat_key_simple for w in re.findall(r"[a-z]+", tk)):
-                    match_key = tk
-                    break
-        if not match_key:
-            # cat inconnue → on ignore ce couple
+        if not match:
             continue
 
-        display = display_map[match_key]
-        pairs[display] = (columns[i], comment_col)
+        display = display_map[match]
+        pairs[display] = (columns[i], comm)
 
     return pairs
 
 
-def compute_averages_by_fac(df: pd.DataFrame,
-                            pairs: Dict[str, Tuple[str, str]],
-                            pseudo_col: Optional[str],
-                            prenom_col: Optional[str],
-                            nom_col: Optional[str],
-                            email_col: Optional[str]) -> pd.DataFrame:
-    """Construit la table Moyennes (lignes = catégories, colonnes = facs)."""
+def compute_averages_by_fac(df, pairs, pseudo_col, prenom_col, nom_col, email_col):
     rows = []
     for view, (note_col, _) in pairs.items():
-        # Prépare une série de notes et de facs ligne par ligne
-        series_notes = df[note_col].map(parse_note)
+        notes = df[note_col].map(parse_note)
         facs = df.apply(lambda r: infer_faculty_for_row(r, pseudo_col, prenom_col, nom_col, email_col), axis=1)
-        tmp = pd.DataFrame({"fac": facs, "note": series_notes})
-        tmp = tmp.dropna(subset=["note", "fac"])
+
+        tmp = pd.DataFrame({"fac": facs, "note": notes}).dropna()
         if tmp.empty:
-            # aucune note/fac pour cette catégorie
             rows.append({"Catégorie": view, **{FAC_DISPLAY[f]: None for f in FAC_ORDER}})
             continue
-        # Moyenne par fac
-        mean_by_fac = tmp.groupby("fac")["note"].mean().to_dict()
+
+        means = tmp.groupby("fac")["note"].mean().to_dict()
         row = {"Catégorie": view}
         for f in FAC_ORDER:
-            val = mean_by_fac.get(f)
-            row[FAC_DISPLAY[f]] = round(float(val), 2) if val is not None else None
+            row[FAC_DISPLAY[f]] = round(float(means.get(f, float("nan"))), 2) if f in means else None
+
         rows.append(row)
 
-    # DataFrame final trié par Catégorie
     df_avg = pd.DataFrame(rows)
-    # Ordonner les colonnes: Catégorie + facs dans l'ordre demandé (affichages)
     ordered_cols = ["Catégorie"] + [FAC_DISPLAY[f] for f in FAC_ORDER]
-    df_avg = df_avg.reindex(columns=ordered_cols)
-    df_avg = df_avg.sort_values("Catégorie").reset_index(drop=True)
-    return df_avg
+    return df_avg.reindex(columns=ordered_cols).sort_values("Catégorie").reset_index(drop=True)
 
 
-def build_views(df: pd.DataFrame,
-                prenom_col: Optional[str],
-                nom_col: Optional[str],
-                email_col: Optional[str],
-                pairs: Dict[str, Tuple[str, str]]) -> Dict[str, pd.DataFrame]:
-    sheets: Dict[str, pd.DataFrame] = {}
+def build_views(df, prenom_col, nom_col, email_col, pairs):
+    sheets = {}
     for display, (note_col, comm_col) in pairs.items():
-        cols = [c for c in [prenom_col, nom_col, email_col, note_col, comm_col] if c and c in df.columns]
-        if not cols:
-            continue
-        temp = df[cols].copy()
-        rename_map = {}
-        if prenom_col in temp.columns: rename_map[prenom_col] = "Prénom"
-        if nom_col in temp.columns:    rename_map[nom_col]    = "Nom"
-        if email_col in temp.columns:  rename_map[email_col]  = "Email"
-        rename_map[note_col] = "Note"
-        rename_map[comm_col] = "Commentaire"
-        temp.rename(columns=rename_map, inplace=True)
-        if "Note" not in temp.columns:
-            continue
-        temp["__note_num"] = temp["Note"].map(parse_note)
-        temp = temp[temp["__note_num"] < 3.0].drop(columns="__note_num")
-        ordered = [c for c in ["Prénom", "Nom", "Email", "Note", "Commentaire"] if c in temp.columns]
-        sheets[display] = temp[ordered]
+        needed = [c for c in [prenom_col, nom_col, email_col, note_col, comm_col] if c in df.columns]
+
+        temp = df[needed].copy()
+        rename = {
+            prenom_col: "Prénom",
+            nom_col: "Nom",
+            email_col: "Email",
+            note_col: "Note",
+            comm_col: "Commentaire",
+        }
+        temp.rename(columns={k: v for k, v in rename.items() if k}, inplace=True)
+
+        temp["__note"] = temp["Note"].map(parse_note)
+        temp = temp[temp["__note"] < 3].drop(columns="__note")
+
+        final_cols = [c for c in ["Prénom", "Nom", "Email", "Note", "Commentaire"] if c in temp.columns]
+        sheets[display] = temp[final_cols]
+
     return sheets
 
 
-def write_output(output_path: Path, df_avg: pd.DataFrame, sheets: Dict[str, pd.DataFrame]) -> None:
-    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
-        df_avg.to_excel(writer, sheet_name="Moyennes", index=False)
-        for view in ["Coaching", "Fiches de cours", "Professeurs", "Plateforme", "Organisation générale"]:
-            df_view = sheets.get(view, pd.DataFrame(columns=["Prénom", "Nom", "Email", "Note", "Commentaire"]))
-            df_view.to_excel(writer, sheet_name=view[:31], index=False)
+# ========= NEW FEATURES ========= #
 
+def build_commentaires_view(df, prenom_col, nom_col, email_col, pseudo_col):
+    comment_cols = [c for c in df.columns if _is_comment_col(normalize(c))]
+
+    rows = []
+    for _, r in df.iterrows():
+        comments = []
+        for col in comment_cols:
+            v = r.get(col)
+            if isinstance(v, str) and v.strip():
+                comments.append(f"{col}: {v.strip()}")
+
+        if not comments:
+            continue
+
+        fac = infer_faculty_for_row(r, pseudo_col, prenom_col, nom_col, email_col)
+
+        rows.append({
+            "Prénom": r.get(prenom_col, ""),
+            "Nom": r.get(nom_col, ""),
+            "Email": r.get(email_col, ""),
+            "Fac": FAC_DISPLAY.get(fac, fac) if fac else "",
+            "Commentaires": "\n".join(comments),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_recommandations_view(df, prenom_col, nom_col, email_col, pseudo_col):
+    if RECO_COL_EXACT not in df.columns:
+        return pd.DataFrame(columns=["Prénom", "Nom", "Email", "Fac", "Recommandation"])
+
+    rows = []
+    for _, r in df.iterrows():
+        rec = r.get(RECO_COL_EXACT)
+        if isinstance(rec, str) and rec.strip():
+            fac = infer_faculty_for_row(r, pseudo_col, prenom_col, nom_col, email_col)
+            rows.append({
+                "Prénom": r.get(prenom_col, ""),
+                "Nom": r.get(nom_col, ""),
+                "Email": r.get(email_col, ""),
+                "Fac": FAC_DISPLAY.get(fac, fac) if fac else "",
+                "Recommandation": rec.strip(),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def write_output(path, df_avg, standard_views, commentaires_df, reco_df):
+    with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+        df_avg.to_excel(writer, sheet_name="Moyennes", index=False)
+
+        for view in ["Coaching", "Fiches de cours", "Professeurs", "Plateforme", "Organisation générale"]:
+            df_v = standard_views.get(view, pd.DataFrame(columns=["Prénom", "Nom", "Email", "Note", "Commentaire"]))
+            df_v.to_excel(writer, sheet_name=view[:31], index=False)
+
+        commentaires_df.to_excel(writer, sheet_name="Commentaires", index=False)
+        reco_df.to_excel(writer, sheet_name="Recommandations", index=False)
+
+
+# ========= MAIN ========= #
 
 def main():
-    parser = argparse.ArgumentParser(description="Génère un Excel 'Moyennes (par fac) + Vues (<3/5)' à partir d’un export.")
-    parser.add_argument("-i", "--input", required=True, help="Chemin du fichier Excel source (xlsx/xls).")
-    parser.add_argument("-o", "--output", default="vues_feedback.xlsx", help="Chemin du fichier Excel de sortie.")
-    parser.add_argument("--prenom", help="Nom exact de la colonne Prénom (optionnel).")
-    parser.add_argument("--nom", help="Nom exact de la colonne Nom (optionnel).")
-    parser.add_argument("--email", help="Nom exact de la colonne Email (optionnel).")
-    parser.add_argument("--pseudo", help="Nom exact de la colonne Pseudo/Identifiant (optionnel).")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-i", "--input", required=True)
+    parser.add_argument("-o", "--output", default="vues_feedback.xlsx")
+    parser.add_argument("--prenom")
+    parser.add_argument("--nom")
+    parser.add_argument("--email")
+    parser.add_argument("--pseudo")
     args = parser.parse_args()
 
     in_path = Path(args.input)
     out_path = Path(args.output)
 
     if not in_path.exists():
-        print(f"Erreur: fichier introuvable: {in_path}", file=sys.stderr)
+        print(f"Erreur: fichier introuvable → {in_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Lecture
     df = read_all_sheets(in_path)
     if df.empty:
-        print("Erreur: aucune donnée lisible dans le fichier source.", file=sys.stderr)
+        print("Erreur: fichier vide", file=sys.stderr)
         sys.exit(1)
 
-    # Colonnes identité + pseudo + paires
     prenom_col, nom_col, email_col = find_identity_columns(df, args.prenom, args.nom, args.email)
     pseudo_col = find_pseudo_column(df, args.pseudo)
+
     pairs = build_pairs(df)
-
-    if not pairs:
-        print("Erreur: aucune paire détectée. "
-              "Astuce: pour chaque catégorie, mets un commentaire dans l'une des 2 colonnes suivant "
-              "la colonne 'Note …' OU 'Sur une échelle de 0 à 5 …'.",
-              file=sys.stderr)
-        # Aperçu des en-têtes pour debug
-        for c in df.columns:
-            print(f"- {c}", file=sys.stderr)
-        sys.exit(1)
-
-    # Moyennes par fac + vues filtrées
     df_avg = compute_averages_by_fac(df, pairs, pseudo_col, prenom_col, nom_col, email_col)
-    sheets = build_views(df, prenom_col, nom_col, email_col, pairs)
+    standard_views = build_views(df, prenom_col, nom_col, email_col, pairs)
 
-    # Écriture
-    write_output(out_path, df_avg, sheets)
+    commentaires_df = build_commentaires_view(df, prenom_col, nom_col, email_col, pseudo_col)
+    reco_df = build_recommandations_view(df, prenom_col, nom_col, email_col, pseudo_col)
 
-    # Résumé console
-    print(f"✅ Fichier généré: {out_path}")
-    print("Feuilles écrites:", ", ".join(REQUIRED_SHEETS))
-    print("Colonnes détectées/forcées:",
-          f"Prénom={prenom_col or '-'} | Nom={nom_col or '-'} | Email={email_col or '-'} | Pseudo={pseudo_col or '-'}")
-    print("Paires (colonne de note/échelle → commentaire):")
-    for k, (ncol, ccol) in pairs.items():
-        print(f"  - {k}: Note/Echelle='{ncol}'  |  Commentaire='{ccol}'")
+    write_output(out_path, df_avg, standard_views, commentaires_df, reco_df)
+
+    print(f"✅ Fichier généré : {out_path}")
+    print(f"📄 Feuilles : {', '.join(REQUIRED_SHEETS)}")
 
 
 if __name__ == "__main__":
